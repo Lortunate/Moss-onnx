@@ -3,7 +3,6 @@ use crate::models::SuperResolution;
 use ndarray::{Array, Ix4};
 use opencv::{core, core::Mat, dnn, imgproc, prelude::*};
 use ort::{Result as OrtResult, session::Session, value::Tensor};
-use rayon::prelude::*;
 use std::path::Path;
 
 pub struct RealEsrgan {
@@ -45,6 +44,31 @@ impl RealEsrgan {
         }
     }
 
+    /// Ensure input size is valid for model reshape by padding to even width/height.
+    fn pad_even(input: &Mat) -> (Mat, i32, i32) {
+        let w = input.cols();
+        let h = input.rows();
+        let pad_right = if w % 2 != 0 { 1 } else { 0 };
+        let pad_bottom = if h % 2 != 0 { 1 } else { 0 };
+        if pad_right == 0 && pad_bottom == 0 {
+            return (input.clone(), 0, 0);
+        }
+        let mut padded = Mat::default();
+        // Use core::copy_make_border with REFLECT_101 to avoid visible seams
+        core::copy_make_border(
+            input,
+            &mut padded,
+            0,
+            pad_bottom,
+            0,
+            pad_right,
+            core::BORDER_REFLECT_101,
+            core::Scalar::default(),
+        )
+        .unwrap();
+        (padded, pad_right, pad_bottom)
+    }
+
     fn compose_bgra(out_bgr: &Mat, input: &Mat, depth: i32, w_out: i32, h_out: i32) -> Mat {
         let mut alpha = Mat::default();
         core::extract_channel(input, &mut alpha, 3).unwrap();
@@ -76,11 +100,14 @@ impl SuperResolution for RealEsrgan {
         let (h, w, channels, depth) = (input.rows(), input.cols(), input.channels(), input.depth());
         let scale = Self::scale_from_depth(depth);
         let bgr_input = Self::ensure_bgr(&input, channels);
+        // Pad to even dimensions to satisfy ONNX reshape nodes that assume even H/W
+        let (padded, _pad_right, _pad_bottom) = Self::pad_even(&bgr_input);
+        let (w_pad, h_pad) = (padded.cols(), padded.rows());
 
         let blob = dnn::blob_from_image(
-            &bgr_input,
+            &padded,
             scale,
-            core::Size::new(w, h),
+            core::Size::new(w_pad, h_pad),
             core::Scalar::default(),
             true,
             false,
@@ -89,7 +116,7 @@ impl SuperResolution for RealEsrgan {
         .unwrap();
 
         let blob_slice: &[f32] = blob.data_typed().unwrap();
-        let input_array = Array::from_shape_vec((1, 3, h as usize, w as usize), blob_slice.to_vec()).unwrap();
+        let input_array = Array::from_shape_vec((1, 3, h_pad as usize, w_pad as usize), blob_slice.to_vec()).unwrap();
         let input_tensor = Tensor::from_array(input_array)?;
 
         let outputs = self.session.run(ort::inputs![input_tensor])?;
@@ -101,7 +128,8 @@ impl SuperResolution for RealEsrgan {
 
         let buf = out_mat.data_bytes_mut().unwrap();
         let w_out_usize = w_out as usize;
-        buf.par_chunks_mut(w_out_usize * 3).enumerate().for_each(|(y, row)| {
+        // Avoid thread oversubscription: write in a single-threaded loop
+        for (y, row) in buf.chunks_mut(w_out_usize * 3).enumerate() {
             for x in 0..w_out_usize {
                 let r = out4[[0, 0, y, x]].clamp(0.0, 1.0);
                 let g = out4[[0, 1, y, x]].clamp(0.0, 1.0);
@@ -112,12 +140,31 @@ impl SuperResolution for RealEsrgan {
                 row[idx + 1] = (g * 255.0).round() as u8;
                 row[idx + 2] = (r * 255.0).round() as u8;
             }
-        });
+        }
+
+        // If we padded the input, crop the output back to the original scaled size.
+        // Estimate scale factor from output vs padded input size.
+        let scale_est_w = (w_out as f64) / (w_pad as f64);
+        let scale_est_h = (h_out as f64) / (h_pad as f64);
+        let scale_est = ((scale_est_w + scale_est_h) / 2.0).round() as i32; // assume isotropic scaling (2 or 4)
+        let target_w = w * scale_est;
+        let target_h = h * scale_est;
+
+        let out_cropped = if target_w < w_out || target_h < h_out {
+            let roi = core::Rect::new(0, 0, target_w.max(1), target_h.max(1));
+            let m = out_mat.roi(roi).unwrap();
+            // Convert ROI view to an owned Mat
+            m.try_clone().unwrap()
+        } else {
+            out_mat
+        };
 
         if channels == 4 {
-            Ok(Self::compose_bgra(&out_mat, &input, depth, w_out, h_out))
+            // Compose alpha and then crop if necessary to match target size
+            let out_rgba_full = Self::compose_bgra(&out_cropped, &input, depth, out_cropped.cols(), out_cropped.rows());
+            Ok(out_rgba_full)
         } else {
-            Ok(out_mat)
+            Ok(out_cropped)
         }
     }
 }
